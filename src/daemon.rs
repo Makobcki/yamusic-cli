@@ -349,6 +349,9 @@ impl Daemon {
 
     async fn resume_or_play_current(&self) -> IpcResponse {
         let state = self.audio.state().state();
+        if state == PlaybackState::Playing {
+            return IpcResponse::ok("Already playing", None);
+        }
         if state == PlaybackState::Paused {
             self.audio.resume();
             if let Some(mpris) = &self.mpris {
@@ -393,6 +396,24 @@ impl Daemon {
     }
 
     async fn play_specific_track(&self, track_id: &str) -> IpcResponse {
+        {
+            let q = self.queue.read().await;
+            if let Some(curr) = q.current_track() {
+                if curr.id == track_id {
+                    let state = self.audio.state().state();
+                    if state == PlaybackState::Playing {
+                        return IpcResponse::ok(format!("Already playing: {} — {}", curr.artists_str(), curr.title), None);
+                    } else if state == PlaybackState::Paused {
+                        self.audio.resume();
+                        if let Some(mpris) = &self.mpris {
+                            mpris.update_playback_status(PlaybackState::Playing).await;
+                        }
+                        return IpcResponse::ok(format!("Resumed: {} — {}", curr.artists_str(), curr.title), None);
+                    }
+                }
+            }
+        }
+
         match self.api.get_tracks(&[track_id.to_string()]).await {
             Ok(tracks) if !tracks.is_empty() => {
                 let track = tracks.into_iter().next().unwrap();
