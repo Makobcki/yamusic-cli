@@ -4,7 +4,6 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
 
 use yamusic_cli::client::Client;
@@ -12,8 +11,6 @@ use yamusic_cli::config::Config;
 use yamusic_cli::daemon::Daemon;
 use yamusic_cli::types::{IpcRequest, LoopMode};
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(

@@ -182,7 +182,7 @@ fn audio_thread_main(
 
                     match std::fs::File::open(&path) {
                         Ok(file) => {
-                            let reader = std::io::BufReader::with_capacity(32 * 1024, file);
+                            let reader = std::io::BufReader::with_capacity(512 * 1024, file);
                             match Decoder::new(reader) {
                                 Ok(decoder) => {
                                     sink.append(decoder);
