@@ -428,31 +428,30 @@ impl Daemon {
 
         info!("Preparing to play: {} — {}", track.artists_str(), track.title);
 
-        // Fetch audio bytes (cache or download)
-        let bytes = match self.cache.get(&track.id) {
-            Some(cached) => {
+        // Get file path (cached or stream directly to disk)
+        let file_path = match self.cache.get_path(&track.id) {
+            Some(path) => {
                 info!("Track {} loaded from disk cache", track.id);
-                cached
+                path
             }
             None => {
-                info!("Downloading track {} from Yandex Music CDN...", track.id);
+                let target_path = self.cache.track_file_path(&track.id);
+                info!("Streaming track {} directly to disk...", track.id);
                 let download_url = self
                     .api
                     .resolve_download_url(&track.id, self.config.bitrate)
                     .await
                     .context("Failed to resolve download URL")?;
-                let data = self
-                    .api
-                    .download_track_bytes(&download_url)
+                self.api
+                    .download_track_to_file(&download_url, &target_path)
                     .await
-                    .context("Failed to download track bytes")?;
-                let _ = self.cache.put(&track.id, &data);
-                data
+                    .context("Failed to stream track to file")?;
+                target_path
             }
         };
 
-        // Play in audio sink
-        self.audio.play(bytes, track.id.clone(), Duration::ZERO);
+        // Play file in audio sink (reads small 32KB buffer, zero file heap overhead!)
+        self.audio.play_file(file_path, track.id.clone(), Duration::ZERO);
 
         // Update MPRIS
         if let Some(mpris) = &self.mpris {
@@ -460,7 +459,7 @@ impl Daemon {
             mpris.update_playback_status(PlaybackState::Playing).await;
         }
 
-        // Background: Prefetch next track
+        // Background: Prefetch next track directly to disk
         let next_track_id = {
             let q = self.queue.read().await;
             q.tracks().get(index + 1).map(|t| t.id.clone())
@@ -471,10 +470,9 @@ impl Daemon {
             let bitrate = self.config.bitrate;
             tokio::spawn(async move {
                 if !cache.has(&next_id) {
+                    let target_path = cache.track_file_path(&next_id);
                     if let Ok(url) = api.resolve_download_url(&next_id, bitrate).await {
-                        if let Ok(data) = api.download_track_bytes(&url).await {
-                            let _ = cache.put(&next_id, &data);
-                        }
+                        let _ = api.download_track_to_file(&url, &target_path).await;
                     }
                 }
             });

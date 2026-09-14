@@ -242,6 +242,20 @@ impl YaMusicClient {
         Ok(final_url)
     }
 
+    pub async fn download_track_to_file(&self, url: &str, dst_path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let mut resp = self.http.get(url).send().await?;
+        let tmp_path = dst_path.with_extension(format!("tmp.{}", std::process::id()));
+
+        let mut file = std::fs::File::create(&tmp_path)?;
+        while let Some(chunk) = resp.chunk().await? {
+            file.write_all(&chunk)?;
+        }
+        file.flush()?;
+        std::fs::rename(&tmp_path, dst_path)?;
+        Ok(())
+    }
+
     pub async fn download_track_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let bytes = self.http.get(url).send().await?.bytes().await?;
         Ok(bytes.to_vec())

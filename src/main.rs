@@ -1,16 +1,19 @@
-use anyhow::Context;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
 
 use yamusic_cli::client::Client;
 use yamusic_cli::config::Config;
 use yamusic_cli::daemon::Daemon;
 use yamusic_cli::types::{IpcRequest, LoopMode};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -157,8 +160,15 @@ enum ServiceAction {
     Status,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = Cli::parse();
 
     // Default to Status if no subcommand given

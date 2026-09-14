@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, RwLock};
@@ -10,8 +10,8 @@ use tracing::{error, info};
 use crate::types::PlaybackState;
 
 pub enum AudioCommand {
-    Play {
-        data: Vec<u8>,
+    PlayFile {
+        path: PathBuf,
         track_id: String,
         start_pos: Duration,
     },
@@ -101,8 +101,8 @@ impl AudioPlayer {
         Arc::clone(&self.state)
     }
 
-    pub fn play(&self, data: Vec<u8>, track_id: String, start_pos: Duration) {
-        let _ = self.cmd_tx.send(AudioCommand::Play { data, track_id, start_pos });
+    pub fn play_file(&self, path: PathBuf, track_id: String, start_pos: Duration) {
+        let _ = self.cmd_tx.send(AudioCommand::PlayFile { path, track_id, start_pos });
     }
 
     pub fn pause(&self) {
@@ -170,8 +170,7 @@ fn audio_thread_main(
         // Poll for commands with 50ms timeout for smooth position tracking
         match cmd_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(cmd) => match cmd {
-                AudioCommand::Play { data, track_id, start_pos } => {
-                    // Recreate sink for clean playback of new track
+                AudioCommand::PlayFile { path, track_id, start_pos } => {
                     sink = match Sink::try_new(&stream_handle) {
                         Ok(s) => s,
                         Err(e) => {
@@ -181,29 +180,36 @@ fn audio_thread_main(
                     };
                     sink.set_volume(current_volume);
 
-                    let cursor = Cursor::new(data);
-                    match Decoder::new(cursor) {
-                        Ok(decoder) => {
-                            sink.append(decoder);
-                            if start_pos > Duration::ZERO {
-                                let _ = sink.try_seek(start_pos);
+                    match std::fs::File::open(&path) {
+                        Ok(file) => {
+                            let reader = std::io::BufReader::with_capacity(32 * 1024, file);
+                            match Decoder::new(reader) {
+                                Ok(decoder) => {
+                                    sink.append(decoder);
+                                    if start_pos > Duration::ZERO {
+                                        let _ = sink.try_seek(start_pos);
+                                    }
+                                    sink.play();
+                                    current_track_id = Some(track_id.clone());
+                                    if let Ok(mut lock) = state.current_track_id.write() {
+                                        *lock = Some(track_id);
+                                    }
+                                    state.playback_state.store(1, Ordering::Relaxed);
+                                    was_playing = true;
+                                }
+                                Err(e) => {
+                                    error!("Failed to decode audio file {}: {:?}", path.display(), e);
+                                    current_track_id = None;
+                                    if let Ok(mut lock) = state.current_track_id.write() {
+                                        *lock = None;
+                                    }
+                                    state.playback_state.store(0, Ordering::Relaxed);
+                                    was_playing = false;
+                                }
                             }
-                            sink.play();
-                            current_track_id = Some(track_id.clone());
-                            if let Ok(mut lock) = state.current_track_id.write() {
-                                *lock = Some(track_id);
-                            }
-                            state.playback_state.store(1, Ordering::Relaxed);
-                            was_playing = true;
                         }
                         Err(e) => {
-                            error!("Failed to decode audio: {:?}", e);
-                            current_track_id = None;
-                            if let Ok(mut lock) = state.current_track_id.write() {
-                                *lock = None;
-                            }
-                            state.playback_state.store(0, Ordering::Relaxed);
-                            was_playing = false;
+                            error!("Failed to open audio file {}: {:?}", path.display(), e);
                         }
                     }
                 }
@@ -229,7 +235,6 @@ fn audio_thread_main(
                     }
                 }
                 AudioCommand::Stop => {
-                    // Recreate empty sink on stop
                     sink = match Sink::try_new(&stream_handle) {
                         Ok(s) => s,
                         Err(e) => {
@@ -291,7 +296,6 @@ fn audio_thread_main(
                     state.playback_state.store(1, Ordering::Relaxed);
                 }
             } else {
-                // Sink became empty -> track finished playing!
                 was_playing = false;
                 state.playback_state.store(0, Ordering::Relaxed);
                 state.position_ms.store(0, Ordering::Relaxed);
