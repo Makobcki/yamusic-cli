@@ -199,17 +199,20 @@ async fn async_main() -> Result<()> {
 
             // Check if daemon is running
             if !client.is_daemon_running() {
-                // If it's a playback command, suggest starting daemon
-                eprintln!(
-                    "{} yamusic-cli daemon is not running.",
-                    "Notice:".yellow().bold()
-                );
-                eprintln!(
-                    "Run '{}' or '{}' to start it.",
-                    "yamusic-cli daemon --detach".cyan().bold(),
-                    "systemctl --user start yamusic-cli".cyan()
-                );
-                return Ok(());
+                if cli.json {
+                    println!("{}", serde_json::json!({ "status": "stopped", "running": false }));
+                } else {
+                    eprintln!(
+                        "{} yamusic-cli daemon is not running.",
+                        "Notice:".yellow().bold()
+                    );
+                    eprintln!(
+                        "Run '{}' or '{}' to start it.",
+                        "yamusic-cli daemon --detach".cyan().bold(),
+                        "systemctl --user start yamusic-cli".cyan()
+                    );
+                }
+                std::process::exit(1);
             }
 
             let req = match other {
@@ -319,13 +322,20 @@ fn parse_volume(input: &str) -> Result<(Option<f32>, Option<f32>)> {
 }
 
 fn run_daemon_detached() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+
     let current_exe = std::env::current_exe()?;
-    let child = Command::new(&current_exe)
-        .arg("daemon")
+    let mut cmd = Command::new(&current_exe);
+    cmd.arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn()?;
 
     println!(
         "{} Started yamusic-cli daemon in background (PID: {})",
@@ -355,6 +365,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment="PIPEWIRE_NODE=YandexMusic_EQ" "PULSE_SINK=YandexMusic_EQ"
 ExecStart={} daemon
 Restart=on-failure
 RestartSec=5
