@@ -18,6 +18,13 @@ use crate::mpris::MprisHandler;
 use crate::queue::{PlayQueue, QueueSource};
 use crate::types::*;
 
+struct ActiveRotorPlayback {
+    session_id: String,
+    batch_id: Option<String>,
+    track_key: String,
+    started_at: std::time::Instant,
+}
+
 pub struct Daemon {
     api: Arc<YaMusicClient>,
     user_id: u64,
@@ -27,6 +34,8 @@ pub struct Daemon {
     liked_ids: Arc<RwLock<HashSet<String>>>,
     mpris: Option<Arc<MprisHandler>>,
     config: Config,
+    active_rotor: Arc<RwLock<Option<ActiveRotorPlayback>>>,
+    is_refilling: Arc<std::sync::atomic::AtomicBool>,
     #[allow(dead_code)]
     cmd_tx: UnboundedSender<IpcRequest>,
 }
@@ -68,11 +77,13 @@ impl Daemon {
         let liked_ids = Arc::new(RwLock::new(liked_set));
 
         // Initialize Audio player
-        info!("Initializing audio player with volume {}...", config.volume);
-        let (audio, event_rx) = AudioPlayer::start(config.volume)?;
+        info!("Initializing audio player with volume {} (fade: {}ms)...", config.volume, config.fade_duration_ms);
+        let (audio, event_rx) = AudioPlayer::start(config.volume, config.fade_duration_ms)?;
 
         let cache = TrackCache::new(config.get_cache_dir(), config.cache_enabled);
         let queue = Arc::new(RwLock::new(PlayQueue::new()));
+        let active_rotor = Arc::new(RwLock::new(None));
+        let is_refilling = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let (cmd_tx, mut cmd_rx) = unbounded_channel::<IpcRequest>();
 
@@ -98,6 +109,8 @@ impl Daemon {
             liked_ids,
             mpris,
             config,
+            active_rotor,
+            is_refilling,
             cmd_tx: cmd_tx.clone(),
         });
 
@@ -235,6 +248,21 @@ impl Daemon {
             }
             IpcRequest::Stop => {
                 self.audio.stop();
+                if let Some(prev) = self.active_rotor.write().await.take() {
+                    let played_secs = prev.started_at.elapsed().as_secs_f64();
+                    let api = Arc::clone(&self.api);
+                    tokio::spawn(async move {
+                        let _ = api
+                            .send_rotor_feedback(
+                                &prev.session_id,
+                                prev.batch_id.as_deref(),
+                                "skip",
+                                Some(&prev.track_key),
+                                Some(played_secs),
+                            )
+                            .await;
+                    });
+                }
                 if let Some(mpris) = &self.mpris {
                     mpris.update_playback_status(PlaybackState::Stopped).await;
                     mpris.update_track(None).await;
@@ -270,9 +298,9 @@ impl Daemon {
             IpcRequest::Like { track_id } => self.like_track(track_id).await,
             IpcRequest::Unlike { track_id } => self.unlike_track(track_id).await,
             IpcRequest::Playlists => self.list_playlists().await,
-            IpcRequest::PlayPlaylist { name_or_kind } => self.play_playlist(&name_or_kind).await,
+            IpcRequest::PlayPlaylist { name_or_kind, shuffle } => self.play_playlist(&name_or_kind, shuffle).await,
             IpcRequest::PlayWave => self.load_wave(true).await,
-            IpcRequest::PlayLiked => self.load_liked(true).await,
+            IpcRequest::PlayLiked { shuffle } => self.load_liked(true, shuffle).await,
             IpcRequest::Search { query } => self.search_tracks(&query).await,
             IpcRequest::Queue => self.get_queue_info().await,
             IpcRequest::Jump { index } => self.jump_to_index(index).await,
@@ -449,6 +477,23 @@ impl Daemon {
 
         info!("Preparing to play: {} — {}", track.artists_str(), track.title);
 
+        // Rotor feedback: if previous track was playing in Wave and not yet finished, report skip
+        if let Some(prev) = self.active_rotor.write().await.take() {
+            let played_secs = prev.started_at.elapsed().as_secs_f64();
+            let api = Arc::clone(&self.api);
+            tokio::spawn(async move {
+                let _ = api
+                    .send_rotor_feedback(
+                        &prev.session_id,
+                        prev.batch_id.as_deref(),
+                        "skip",
+                        Some(&prev.track_key),
+                        Some(played_secs),
+                    )
+                    .await;
+            });
+        }
+
         // Get file path (cached or stream directly to disk)
         let file_path = match self.cache.get_path(&track.id) {
             Some(path) => {
@@ -480,6 +525,38 @@ impl Daemon {
             mpris.update_playback_status(PlaybackState::Playing).await;
         }
 
+        // Rotor feedback: if MyWave, track start
+        if is_wave {
+            let (sess_id, b_id) = {
+                let q = self.queue.read().await;
+                match q.source() {
+                    QueueSource::MyWave { session_id, batch_id } => (session_id.clone(), batch_id.clone()),
+                    _ => (String::new(), None),
+                }
+            };
+            if !sess_id.is_empty() {
+                let track_key = track.rotor_key();
+                *self.active_rotor.write().await = Some(ActiveRotorPlayback {
+                    session_id: sess_id.clone(),
+                    batch_id: b_id.clone(),
+                    track_key: track_key.clone(),
+                    started_at: std::time::Instant::now(),
+                });
+                let api = Arc::clone(&self.api);
+                tokio::spawn(async move {
+                    let _ = api
+                        .send_rotor_feedback(
+                            &sess_id,
+                            b_id.as_deref(),
+                            "trackStarted",
+                            Some(&track_key),
+                            Some(0.0),
+                        )
+                        .await;
+                });
+            }
+        }
+
         // Background: Prefetch next track directly to disk
         let next_track_id = {
             let q = self.queue.read().await;
@@ -501,38 +578,66 @@ impl Daemon {
 
         // Background: Refill My Wave if remaining tracks low
         if is_wave && remaining < 4 {
-            let d = Arc::clone(&self.api);
-            let q_arc = Arc::clone(&self.queue);
-            tokio::spawn(async move {
-                let session_id = {
-                    let q = q_arc.read().await;
-                    match q.source() {
-                        QueueSource::MyWave { session_id, .. } => Some(session_id.clone()),
-                        _ => None,
-                    }
-                };
-                if let Some(sess_id) = session_id {
-                    let recent_keys: Vec<String> = {
+            if self.is_refilling.compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ).is_ok() {
+                let d = Arc::clone(&self.api);
+                let q_arc = Arc::clone(&self.queue);
+                let is_refilling = Arc::clone(&self.is_refilling);
+                tokio::spawn(async move {
+                    let (session_id, _batch_id) = {
                         let q = q_arc.read().await;
-                        q.tracks()
-                            .iter()
-                            .rev()
-                            .take(5)
-                            .map(|t| format!("{}:{}", t.id, t.album_id().unwrap_or(0)))
-                            .collect()
+                        match q.source() {
+                            QueueSource::MyWave { session_id, batch_id } => (Some(session_id.clone()), batch_id.clone()),
+                            _ => (None, None),
+                        }
                     };
-                    if let Ok(new_tracks) = d.rotor_next_tracks(&sess_id, &recent_keys).await {
-                        info!("Auto-refilled My Wave queue with {} new tracks", new_tracks.len());
-                        q_arc.write().await.append_tracks(new_tracks);
+                    if let Some(sess_id) = session_id {
+                        let remaining_keys: Vec<String> = {
+                            let q = q_arc.read().await;
+                            q.remaining_rotor_keys(10)
+                        };
+                        if let Ok(station_tracks) = d.rotor_next_tracks(&sess_id, &remaining_keys, &[]).await {
+                            let new_tracks: Vec<Track> = station_tracks.sequence.into_iter().map(|it| it.track).collect();
+                            info!("Auto-refilled My Wave queue with {} new tracks", new_tracks.len());
+                            let mut q = q_arc.write().await;
+                            if let QueueSource::MyWave { ref mut batch_id, .. } = q.source_mut() {
+                                if station_tracks.batch_id.is_some() {
+                                    *batch_id = station_tracks.batch_id;
+                                }
+                            }
+                            q.append_tracks(new_tracks);
+                        }
                     }
-                }
-            });
+                    is_refilling.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
         }
 
         Ok(())
     }
 
     async fn handle_track_finished(&self) {
+        // Send trackFinished feedback to Rotor if playing MyWave
+        if let Some(active) = self.active_rotor.write().await.take() {
+            let played_secs = active.started_at.elapsed().as_secs_f64();
+            let api = Arc::clone(&self.api);
+            tokio::spawn(async move {
+                let _ = api
+                    .send_rotor_feedback(
+                        &active.session_id,
+                        active.batch_id.as_deref(),
+                        "trackFinished",
+                        Some(&active.track_key),
+                        Some(played_secs),
+                    )
+                    .await;
+            });
+        }
+
         let (next_index, has_next) = {
             let mut q = self.queue.write().await;
             match q.next() {
@@ -625,6 +730,35 @@ impl Daemon {
         match self.api.like_track(self.user_id, &id).await {
             Ok(_) => {
                 self.liked_ids.write().await.insert(id.clone());
+
+                // If currently playing in MyWave, send like feedback to Rotor
+                let rotor_info = {
+                    let q = self.queue.read().await;
+                    if q.is_my_wave() {
+                        if let QueueSource::MyWave { session_id, batch_id } = q.source() {
+                            q.current_track().map(|t| (session_id.clone(), batch_id.clone(), t.rotor_key()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some((sess_id, b_id, track_key)) = rotor_info {
+                    let api = Arc::clone(&self.api);
+                    tokio::spawn(async move {
+                        let _ = api
+                            .send_rotor_feedback(
+                                &sess_id,
+                                b_id.as_deref(),
+                                "like",
+                                Some(&track_key),
+                                None,
+                            )
+                            .await;
+                    });
+                }
+
                 IpcResponse::ok(format!("Liked track {}", id), Some(json!({ "liked": true, "track_id": id })))
             }
             Err(e) => IpcResponse::err(format!("Failed to like track: {:?}", e)),
@@ -646,6 +780,35 @@ impl Daemon {
         match self.api.unlike_track(self.user_id, &id).await {
             Ok(_) => {
                 self.liked_ids.write().await.remove(&id);
+
+                // If currently playing in MyWave, send unlike feedback to Rotor
+                let rotor_info = {
+                    let q = self.queue.read().await;
+                    if q.is_my_wave() {
+                        if let QueueSource::MyWave { session_id, batch_id } = q.source() {
+                            q.current_track().map(|t| (session_id.clone(), batch_id.clone(), t.rotor_key()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some((sess_id, b_id, track_key)) = rotor_info {
+                    let api = Arc::clone(&self.api);
+                    tokio::spawn(async move {
+                        let _ = api
+                            .send_rotor_feedback(
+                                &sess_id,
+                                b_id.as_deref(),
+                                "unlike",
+                                Some(&track_key),
+                                None,
+                            )
+                            .await;
+                    });
+                }
+
                 IpcResponse::ok(format!("Unliked track {}", id), Some(json!({ "liked": false, "track_id": id })))
             }
             Err(e) => IpcResponse::err(format!("Failed to unlike track: {:?}", e)),
@@ -669,10 +832,25 @@ impl Daemon {
                     let mut q = self.queue.write().await;
                     q.set_tracks(
                         "Моя волна".to_string(),
-                        QueueSource::MyWave { session_id, batch_id },
+                        QueueSource::MyWave { session_id: session_id.clone(), batch_id: batch_id.clone() },
                         tracks,
                         0,
                     );
+                }
+
+                if let Some(ref b_id) = batch_id {
+                    let api = Arc::clone(&self.api);
+                    let sess_id = session_id.clone();
+                    let b_id_clone = b_id.clone();
+                    tokio::spawn(async move {
+                        let _ = api.send_rotor_feedback(
+                            &sess_id,
+                            Some(&b_id_clone),
+                            "radioStarted",
+                            None,
+                            None,
+                        ).await;
+                    });
                 }
 
                 if start_playback {
@@ -685,7 +863,7 @@ impl Daemon {
         }
     }
 
-    pub async fn load_liked(&self, start_playback: bool) -> IpcResponse {
+    pub async fn load_liked(&self, start_playback: bool, shuffle: Option<bool>) -> IpcResponse {
         info!("Loading Liked Tracks...");
         match self.api.get_liked_track_ids(self.user_id).await {
             Ok(ids) => {
@@ -703,6 +881,9 @@ impl Daemon {
                                 tracks,
                                 0,
                             );
+                            if let Some(shuf) = shuffle {
+                                q.set_shuffle(shuf);
+                            }
                         }
                         if start_playback {
                             let _ = self.play_index(0).await;
@@ -743,13 +924,13 @@ impl Daemon {
         }
     }
 
-    async fn play_playlist(&self, name_or_kind: &str) -> IpcResponse {
+    async fn play_playlist(&self, name_or_kind: &str, shuffle: Option<bool>) -> IpcResponse {
         let lower = name_or_kind.to_lowercase();
         if lower == "wave" || lower == "моя волна" || lower == "my wave" {
             return self.load_wave(true).await;
         }
         if lower == "liked" || lower == "любимые треки" || lower == "избранное" || lower == "favorites" {
-            return self.load_liked(true).await;
+            return self.load_liked(true, shuffle).await;
         }
 
         // Match playlist by kind or name
@@ -777,6 +958,9 @@ impl Daemon {
                                     tracks,
                                     0,
                                 );
+                                if let Some(shuf) = shuffle {
+                                    q.set_shuffle(shuf);
+                                }
                             }
                             match self.play_index(0).await {
                                 Ok(_) => IpcResponse::ok(format!("Playing playlist '{}'", pl.title), None),

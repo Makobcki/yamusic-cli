@@ -114,6 +114,9 @@ bitrate = 320
 
 # Enable MPRIS2 D-Bus server (default: true)
 mpris_enabled = true
+
+# Fade in/out duration in milliseconds for play/pause and track transitions (default: 200, 0 to disable)
+fade_duration_ms = 200
 ```
 
 ---

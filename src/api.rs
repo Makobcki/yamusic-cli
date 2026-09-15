@@ -279,10 +279,15 @@ impl YaMusicClient {
         Ok(station_tracks)
     }
 
-    pub async fn rotor_next_tracks(&self, session_id: &str, queue: &[String]) -> Result<Vec<Track>> {
+    pub async fn rotor_next_tracks(
+        &self,
+        session_id: &str,
+        queue: &[String],
+        feedbacks: &[RotorFeedback],
+    ) -> Result<RotorStationTracks> {
         let url = format!("{}/rotor/session/{}/tracks", BASE_URL, session_id);
         let body = json!({
-            "feedbacks": [],
+            "feedbacks": feedbacks,
             "queue": queue
         });
 
@@ -297,7 +302,35 @@ impl YaMusicClient {
 
         let res = val.get("result").context("Empty rotor next tracks response")?;
         let result: RotorStationTracks = serde_json::from_value(res.clone())?;
-        let tracks: Vec<Track> = result.sequence.into_iter().map(|it| it.track).collect();
-        Ok(tracks)
+        Ok(result)
+    }
+
+    pub async fn send_rotor_feedback(
+        &self,
+        session_id: &str,
+        batch_id: Option<&str>,
+        event_type: &str,
+        track_key: Option<&str>,
+        total_played_seconds: Option<f64>,
+    ) -> Result<()> {
+        let url = format!("{}/rotor/session/{}/feedback", BASE_URL, session_id);
+        let feedback = RotorFeedback {
+            event: RotorFeedbackEvent {
+                event_type: event_type.to_string(),
+                track_id: track_key.map(|s| s.to_string()),
+                total_played_seconds,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+            batch_id: batch_id.map(|s| s.to_string()),
+            from: "yamusic-cli".to_string(),
+        };
+
+        let resp = self.http.post(&url).json(&feedback).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("Rotor feedback error ({}): {}", status, text);
+        }
+        Ok(())
     }
 }

@@ -19,6 +19,9 @@ impl TrackCache {
     }
 
     pub fn get_path(&self, track_id: &str) -> Option<PathBuf> {
+        if !self.enabled {
+            return None;
+        }
         let path = self.track_file_path(track_id);
         if path.exists() && fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
             Some(path)

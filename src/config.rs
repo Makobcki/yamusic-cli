@@ -15,6 +15,8 @@ pub struct Config {
     pub bitrate: u32,
     #[serde(default = "default_mpris_enabled")]
     pub mpris_enabled: bool,
+    #[serde(default = "default_fade_duration_ms")]
+    pub fade_duration_ms: u64,
 }
 
 fn default_volume() -> f32 {
@@ -33,6 +35,10 @@ fn default_mpris_enabled() -> bool {
     true
 }
 
+fn default_fade_duration_ms() -> u64 {
+    200
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -42,6 +48,7 @@ impl Default for Config {
             cache_dir: None,
             bitrate: default_bitrate(),
             mpris_enabled: default_mpris_enabled(),
+            fade_duration_ms: default_fade_duration_ms(),
         }
     }
 }
@@ -157,3 +164,42 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg = Config::default();
+        assert_eq!(cfg.fade_duration_ms, 200);
+        assert_eq!(cfg.volume, 0.7);
+        assert!(cfg.cache_enabled);
+        assert!(cfg.mpris_enabled);
+    }
+
+    #[test]
+    fn test_parse_config_with_custom_fade() {
+        let toml_str = r#"
+            token = "test_token"
+            volume = 0.5
+            fade_duration_ms = 350
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.token, "test_token");
+        assert_eq!(cfg.volume, 0.5);
+        assert_eq!(cfg.fade_duration_ms, 350);
+        assert!(cfg.cache_enabled); // default
+    }
+
+    #[test]
+    fn test_parse_config_with_disabled_fade() {
+        let toml_str = r#"
+            token = "test_token"
+            fade_duration_ms = 0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.fade_duration_ms, 0);
+    }
+}
+

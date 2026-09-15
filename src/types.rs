@@ -101,6 +101,13 @@ impl Track {
         self.albums.first().map(|a| a.id)
     }
 
+    pub fn rotor_key(&self) -> String {
+        match self.album_id() {
+            Some(album_id) => format!("{}:{}", self.id, album_id),
+            None => self.id.clone(),
+        }
+    }
+
     pub fn cover_url(&self, size: u32) -> Option<String> {
         self.cover_uri.as_ref().map(|uri| {
             let base = if uri.ends_with("%%") {
@@ -219,6 +226,30 @@ pub struct RotorStationTracks {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotorFeedbackEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    #[serde(rename = "trackId", skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<String>,
+    #[serde(rename = "totalPlayedSeconds", skip_serializing_if = "Option::is_none")]
+    pub total_played_seconds: Option<f64>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotorFeedback {
+    pub event: RotorFeedbackEvent,
+    #[serde(rename = "batchId", skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(default = "default_feedback_from")]
+    pub from: String,
+}
+
+fn default_feedback_from() -> String {
+    "yamusic-cli".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
     pub result: Option<T>,
     pub error: Option<serde_json::Value>,
@@ -268,9 +299,9 @@ pub enum IpcRequest {
     Like { track_id: Option<String> },
     Unlike { track_id: Option<String> },
     Playlists,
-    PlayPlaylist { name_or_kind: String },
+    PlayPlaylist { name_or_kind: String, shuffle: Option<bool> },
     PlayWave,
-    PlayLiked,
+    PlayLiked { shuffle: Option<bool> },
     Search { query: String },
     Queue,
     Jump { index: usize },

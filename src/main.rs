@@ -36,6 +36,9 @@ enum Commands {
     Daemon {
         #[arg(short, long, help = "Run daemon in background (detached process)")]
         detach: bool,
+
+        #[arg(long, help = "Fade in/out duration in milliseconds (default: 200, 0 to disable)")]
+        fade_duration_ms: Option<u64>,
     },
 
     #[command(about = "Show current playback status")]
@@ -108,13 +111,19 @@ enum Commands {
     Playlist {
         #[arg(help = "Playlist name or kind ID")]
         name: String,
+
+        #[arg(short, long, help = "Shuffle tracks")]
+        shuffle: bool,
     },
 
     #[command(about = "Switch playback to 'Моя волна' (My Wave)")]
     Wave,
 
     #[command(about = "Switch playback to 'Любимые треки' (Liked Tracks)")]
-    Liked,
+    Liked {
+        #[arg(short, long, help = "Shuffle tracks")]
+        shuffle: bool,
+    },
 
     #[command(about = "Show current playback queue")]
     Queue,
@@ -172,9 +181,9 @@ async fn async_main() -> Result<()> {
     let command = cli.command.unwrap_or(Commands::Status);
 
     match command {
-        Commands::Daemon { detach } => {
+        Commands::Daemon { detach, fade_duration_ms } => {
             if detach {
-                run_daemon_detached()?;
+                run_daemon_detached(fade_duration_ms, cli.token.as_deref())?;
                 return Ok(());
             }
 
@@ -186,7 +195,10 @@ async fn async_main() -> Result<()> {
                 )
                 .init();
 
-            let config = Config::load(cli.token.as_deref())?;
+            let mut config = Config::load(cli.token.as_deref())?;
+            if let Some(fade_ms) = fade_duration_ms {
+                config.fade_duration_ms = fade_ms;
+            }
             Daemon::start(config).await?;
         }
         Commands::Service { action } => match action {
@@ -254,9 +266,14 @@ async fn async_main() -> Result<()> {
                     track_id: None,
                 },
                 Commands::Playlists => IpcRequest::Playlists,
-                Commands::Playlist { name } => IpcRequest::PlayPlaylist { name_or_kind: name },
+                Commands::Playlist { name, shuffle } => IpcRequest::PlayPlaylist {
+                    name_or_kind: name,
+                    shuffle: if shuffle { Some(true) } else { None },
+                },
                 Commands::Wave => IpcRequest::PlayWave,
-                Commands::Liked => IpcRequest::PlayLiked,
+                Commands::Liked { shuffle } => IpcRequest::PlayLiked {
+                    shuffle: if shuffle { Some(true) } else { None },
+                },
                 Commands::Queue => IpcRequest::Queue,
                 Commands::Jump { index } => {
                     // Convert 1-based index to 0-based if > 0
@@ -321,14 +338,20 @@ fn parse_volume(input: &str) -> Result<(Option<f32>, Option<f32>)> {
     }
 }
 
-fn run_daemon_detached() -> Result<()> {
+fn run_daemon_detached(fade_duration_ms: Option<u64>, token: Option<&str>) -> Result<()> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
     let current_exe = std::env::current_exe()?;
     let mut cmd = Command::new(&current_exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
+    cmd.arg("daemon");
+    if let Some(fade_ms) = fade_duration_ms {
+        cmd.arg("--fade-duration-ms").arg(fade_ms.to_string());
+    }
+    if let Some(t) = token {
+        cmd.arg("--token").arg(t);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
